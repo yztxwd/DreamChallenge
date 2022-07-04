@@ -7,24 +7,24 @@ FLAGS = args_parse.parse_common_options(
     logdir='./conv_model/',
     batch_size=512,
     momentum=0.5,
-    lr=0.001,
-    num_epochs=2,
-    num_workers=32)
+    lr=0.0001,
+    num_epochs=100,
+    num_workers=32,
+    opts=[('--patience', {'type': int, 'default': 5}),
+          ('--train_epochs', {'type': int, 'default': None})])
 
 import os
 import shutil
 import sys
-from collections import OrderedDict
+import subprocess
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import datasets, transforms
 import torch_xla
 import torch_xla.debug.metrics as met
 import torch_xla.distributed.parallel_loader as pl
-import torch_xla.utils.utils as xu
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 import torch_xla.test.test_utils as test_utils
@@ -35,67 +35,17 @@ from dataloader import DreamChallengeDataModule
 from tqdm import tqdm
 from torchmetrics import MeanSquaredError
 
-class ConvolutionalModel(nn.Module):
-    def __init__(self):
-        super(ConvolutionalModel, self).__init__()
-
-        self.model_strand_specific_forward = nn.Sequential(OrderedDict([
-            ('conv1', nn.Conv1d(4, 256, 31, padding=15)),
-            ('relu1', nn.ReLU()),
-            ('conv2', nn.Conv1d(256, 256, 31, padding=15)),
-            ('relu2', nn.ReLU())
-        ]))
-        self.model_strand_specific_reverse = nn.Sequential(OrderedDict([
-            ('conv1', nn.Conv1d(4, 256, 31, padding=15)),
-            ('relu1', nn.ReLU()),
-            ('conv2', nn.Conv1d(256, 256, 31, padding=15)),
-            ('relu2', nn.ReLU())
-        ]))
-        self.model_body = nn.Sequential(OrderedDict([
-            ('conv3', nn.Conv1d(512, 256, 31, padding=15)),
-            ('relu3', nn.ReLU()),
-            ('conv4', nn.Conv1d(256, 256, 31, padding=15)),
-            ('relu4', nn.ReLU()),
-            ('faltten', nn.Flatten()),
-            ('dense1', nn.Linear(110*256, 256)),
-            ('relu5', nn.ReLU()),
-            ('dropout1', nn.Dropout(0.2)),
-            ('dense2', nn.Linear(256, 256)),
-            ('relu6', nn.ReLU()),
-            ('dropout1', nn.Dropout(0.2))
-        ]))
-        self.model_head = nn.Sequential(OrderedDict([
-            ('dense_head', nn.Linear(256, 1))
-        ]))
-
-        self.example_input = torch.zeros(512, 4, 500).index_fill_(1, torch.tensor(2), 1)
-
-    def forward(self, seq):
-        seq_revcomp = torch.flip(seq.detach().clone(), [1, 2])
-        y_hat_for = self.model_strand_specific_forward(seq)
-        y_hat_rev = self.model_strand_specific_reverse(seq_revcomp)
-        y_hat = torch.cat([y_hat_for, y_hat_rev], dim=1)
-        y_hat = self.model_body(y_hat)
-        y_hat = self.model_head(y_hat)
-
-        return y_hat
-
-def plot_scatter(x, y, writer, lim=20):
-  fig = plt.figure(12, 12)
-  ax = sns.scatterplot(x=x, y=y)
-  ax.set_xlim(left=0, right=lim)
-  ax.set_ylim(bottom=0, right=lim)
-  writer.add_figure("Prediction on test data", fig)  
+import models
 
 def _train_update(device, x, loss, tracker, writer):
   loss_item = loss.item()
-  test_utils.print_training_update(
-      device,
-      x,
-      loss_item,
-      tracker.rate(),
-      tracker.global_rate(),
-      summary_writer=writer)
+  #test_utils.print_training_update(
+  #    device,
+  #    x
+  #    loss_item,
+  #    tracker.rate(),
+  #    tracker.global_rate(),
+  #    summary_writer=writer)
   test_utils.write_to_summary(
       writer,
       dict_to_write={
@@ -105,7 +55,10 @@ def _train_update(device, x, loss, tracker, writer):
 def train_model(flags, **kwargs):
   torch.manual_seed(1)
 
-  datamodule = DreamChallengeDataModule(data_dir=flags.datadir, batch_size=flags.batch_size, num_workers=flags.num_workers)
+  print(f"Device {xm.get_ordinal()} in world size of {xm.xrt_world_size()}")
+  num_data_instances = xm.xrt_world_size() * flags.num_workers
+  train_epochs = flags.train_epochs if flags.train_epochs is not None else 5391406//num_data_instances//flags.batch_size
+  datamodule = DreamChallengeDataModule(data_dir=flags.datadir, train_epochs=train_epochs, batch_size=flags.batch_size, num_workers=flags.num_workers)
   datamodule.setup()
   train_loader = datamodule.train_dataloader()
   val_loader = datamodule.val_dataloader()
@@ -113,12 +66,13 @@ def train_model(flags, **kwargs):
   # Scale learning rate to num cores
   lr = flags.lr * xm.xrt_world_size()
 
-  device = xm.xla_device()
-  model = ConvolutionalModel().to(device)
+  model = models.ConvolutionalModel()
   writer = None
   if xm.is_master_ordinal():
     writer = test_utils.get_summary_writer(flags.logdir)
-    writer.add_graph(model, model.example_input.to(device))
+    writer.add_graph(model, model.example_input)
+  device = xm.xla_device()
+  model = model.to(device)
   #optimizer = optim.SGD(model.parameters(), lr=lr, momentum=flags.momentum)
   optimizer = optim.Adam(model.parameters(), lr=lr)
   loss_fn = nn.MSELoss()
@@ -128,21 +82,25 @@ def train_model(flags, **kwargs):
     model.train()
     pbar = tqdm(enumerate(loader))
     for step, (data, target) in pbar:
-      optimizer.zero_grad()
       data = torch.squeeze(data, 0)
       target = torch.squeeze(target, 0)
+      optimizer.zero_grad()
       output = model(data)
       loss = loss_fn(output, target)
       loss.backward()
-      xm.optimizer_step(optimizer)
+      #xm.optimizer_step(optimizer)
+      xm.reduce_gradients(optimizer)
+      torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5, error_if_nonfinite=True)
+      optimizer.step()
       tracker.add(flags.batch_size)
-      pbar.set_description("Loss %s" % loss)
-      if step % flags.log_steps == 0:
-        xm.add_step_closure(
-          _train_update,
-          args=(device, step, loss, tracker, writer),
-          run_async=flags.async_closures
-        )
+      if xm.is_master_ordinal():
+        pbar.set_description("Loss %s" % loss.item())
+        #if step % flags.log_steps == 0:
+        #  xm.add_step_closure(
+        #    _train_update,
+        #    args=(device, step, loss, tracker, writer),
+        #    run_async=flags.async_closures
+        #  )
     if xm.is_master_ordinal():
       torch.save({
         'epoch': epoch,
@@ -160,48 +118,29 @@ def train_model(flags, **kwargs):
       target = torch.squeeze(target, 0)
       pred = model(data)
       metrics.update(pred, target)
+      if xm.is_master_ordinal(): 
+        if step == 0:
+          print(torch.stack([target, pred], 1)[:10])
 
     mse = metrics.compute()  
     mse = xm.mesh_reduce('val_mse', mse, np.mean)
     return mse
 
-  def test_loop_fn(loader):
-    model.eval()
-    metrics = MeanSquaredError()
-    pbar = tqdm(enumerate(loader))
-    targets = []
-    preds = []
-    for step, (data, target) in pbar:
-      data = torch.squeeze(data, 0)
-      target = torch.squeeze(target, 0)
-      pred = model(data)
-      metrics.update(pred, target)
-      targets.append(target)
-      preds.append(pred)
-    # collect data from all processes
-    targets = xm.all_gather(torch.stack(targets))
-    preds = xm.all_gather(torch.stack(preds))
-    if xm.is_master_ordinal(): plot_scatter(targets, preds, writer)
-    # compute the MSE per-process then reduce
-    mse = metrics.compute()  
-    mse = xm.mesh_reduce('test_mse', mse, np.mean)
-    return mse
-
   train_device_loader = pl.MpDeviceLoader(train_loader, device)
   val_device_loader = pl.MpDeviceLoader(val_loader, device)
+  # Early stopping
   mse, min_mse = 1e3, 1e3
   best_epoch = -1
+  patience = FLAGS.patience
+  trigger_times = 0
   for epoch in range(1, flags.num_epochs + 1):
     xm.master_print('Epoch {} train begin {}'.format(epoch, test_utils.now()))
     train_loop_fn(epoch, train_device_loader)
     xm.master_print('Epoch {} train end {}'.format(epoch, test_utils.now()))
 
     mse = val_loop_fn(val_device_loader)
-    xm.master_print('Epoch {} test end {}, MSE={:.2f}'.format(
+    xm.master_print('Epoch {} end {}, Val MSE={:.2f}'.format(
         epoch, test_utils.now(), mse))
-    if mse < min_mse:
-      min_mse = mse
-      best_epoch = epoch
     test_utils.write_to_summary(
         writer,
         epoch,
@@ -210,10 +149,26 @@ def train_model(flags, **kwargs):
     if flags.metrics_debug:
       xm.master_print(met.metrics_report())
 
+    # Early stopping
+    if mse > min_mse:
+        trigger_times += 1
+        #print('Trigger Times:', trigger_times)
+        if trigger_times >= patience:
+            print('Early stopping!\nStart to test process.')
+            break
+    else:
+        #print('trigger times: 0')
+        trigger_times = 0
+
+        min_mse = mse
+        best_epoch = epoch
+
   test_utils.close_summary_writer(writer)
   xm.master_print(f'Min MSE: {min_mse:.2f} from Epoch {best_epoch}')
-  return min_mse, best_epoch
+  if xm.is_master_ordinal(): subprocess.run(['cp', os.path.join(flags.logdir, f"checkpoint-epoch{best_epoch}.ckpt"), os.path.join(flags.logdir, f"checkpoint-epoch{best_epoch}-best.ckpt")], shell=True)
 
+  return min_mse, best_epoch
+  
 def _mp_fn(index, flags):
   torch.set_default_tensor_type('torch.FloatTensor')
   mse, best_epoch = train_model(flags)
