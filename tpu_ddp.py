@@ -2,7 +2,7 @@
 import args_parse
 
 FLAGS = args_parse.parse_common_options(
-    log_steps=200,
+    log_steps=20,
     datadir='./shards/',
     logdir='./conv_model/',
     batch_size=512,
@@ -11,7 +11,9 @@ FLAGS = args_parse.parse_common_options(
     num_epochs=100,
     num_workers=32,
     opts=[('--patience', {'type': int, 'default': 5}),
-          ('--train_epochs', {'type': int, 'default': None})])
+          ('--train_epochs', {'type': int, 'default': None}),
+          ('--num_hybrid_conv', {'type': int, 'default': 1}),
+          ('--dropout', {'type': float, 'default': 0.5})])
 
 import os
 import shutil
@@ -36,9 +38,9 @@ from tqdm import tqdm
 from torchmetrics import MeanSquaredError
 
 import models
+import lightning_dreamchallenge
 
-def _train_update(device, x, loss, tracker, writer):
-  loss_item = loss.item()
+def _train_update(device, x, loss_item, tracker, writer):
   #test_utils.print_training_update(
   #    device,
   #    x
@@ -48,8 +50,9 @@ def _train_update(device, x, loss, tracker, writer):
   #    summary_writer=writer)
   test_utils.write_to_summary(
       writer,
+      global_step=x,
       dict_to_write={
-        "loss": loss_item
+        "train_loss": loss_item
       })
 
 def train_model(flags, **kwargs):
@@ -57,8 +60,8 @@ def train_model(flags, **kwargs):
 
   print(f"Device {xm.get_ordinal()} in world size of {xm.xrt_world_size()}")
   num_data_instances = xm.xrt_world_size() * flags.num_workers
-  train_epochs = flags.train_epochs if flags.train_epochs is not None else 5391406//num_data_instances//flags.batch_size
-  datamodule = DreamChallengeDataModule(data_dir=flags.datadir, train_epochs=train_epochs, batch_size=flags.batch_size, num_workers=flags.num_workers)
+  train_steps = flags.train_epochs if flags.train_epochs is not None else 5391406//num_data_instances//flags.batch_size
+  datamodule = DreamChallengeDataModule(data_dir=flags.datadir, train_epochs=train_steps, batch_size=flags.batch_size, num_workers=flags.num_workers)
   datamodule.setup()
   train_loader = datamodule.train_dataloader()
   val_loader = datamodule.val_dataloader()
@@ -66,7 +69,8 @@ def train_model(flags, **kwargs):
   # Scale learning rate to num cores
   lr = flags.lr * xm.xrt_world_size()
 
-  model = models.ConvolutionalModel()
+  #model = models.ConvolutionalModel()
+  model = lightning_dreamchallenge.ConvolutionalModelHybrid(dropout=flags.dropout, num_hybrid_conv=flags.num_hybrid_conv)
   writer = None
   if xm.is_master_ordinal():
     writer = test_utils.get_summary_writer(flags.logdir)
@@ -90,24 +94,26 @@ def train_model(flags, **kwargs):
       loss.backward()
       #xm.optimizer_step(optimizer)
       xm.reduce_gradients(optimizer)
-      torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5, error_if_nonfinite=True)
+      #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5, error_if_nonfinite=True)
       optimizer.step()
       tracker.add(flags.batch_size)
       if xm.is_master_ordinal():
-        pbar.set_description("Loss %s" % loss.item())
-        #if step % flags.log_steps == 0:
-        #  xm.add_step_closure(
-        #    _train_update,
-        #    args=(device, step, loss, tracker, writer),
-        #    run_async=flags.async_closures
-        #  )
+        loss_item = loss.item()
+        global_step = step + (epoch-1) * train_steps * flags.num_workers
+        pbar.set_description("Step: %s, Training Loss %s" % (global_step, loss_item))
+        if step % flags.log_steps == 0:
+          xm.add_step_closure(
+            _train_update,
+            args=(device, global_step, loss_item, tracker, writer),
+            run_async=flags.async_closures
+          )
     if xm.is_master_ordinal():
       torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss.detach().cpu().numpy()
-      }, os.path.join(flags.logdir, f"checkpoint-epoch{epoch}.ckpt"))
+      }, os.path.join(flags.logdir, f"checkpoint-last.ckpt"))
       
   def val_loop_fn(loader):
     model.eval()
@@ -118,9 +124,6 @@ def train_model(flags, **kwargs):
       target = torch.squeeze(target, 0)
       pred = model(data)
       metrics.update(pred, target)
-      if xm.is_master_ordinal(): 
-        if step == 0:
-          print(torch.stack([target, pred], 1)[:10])
 
     mse = metrics.compute()  
     mse = xm.mesh_reduce('val_mse', mse, np.mean)
@@ -143,8 +146,8 @@ def train_model(flags, **kwargs):
         epoch, test_utils.now(), mse))
     test_utils.write_to_summary(
         writer,
-        epoch,
-        dict_to_write={'MSE/val': mse},
+        epoch * train_steps,
+        dict_to_write={'MSE/val_loss': mse},
         write_xla_metrics=True)
     if flags.metrics_debug:
       xm.master_print(met.metrics_report())
@@ -152,16 +155,21 @@ def train_model(flags, **kwargs):
     # Early stopping
     if mse > min_mse:
         trigger_times += 1
-        #print('Trigger Times:', trigger_times)
         if trigger_times >= patience:
             print('Early stopping!\nStart to test process.')
             break
     else:
-        #print('trigger times: 0')
         trigger_times = 0
 
         min_mse = mse
         best_epoch = epoch
+        if xm.is_master_ordinal():
+          torch.save({
+            'epoch': best_epoch,
+            'val_MSE': mse,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+          }, os.path.join(flags.logdir, f"checkpoint-best.ckpt"))
 
   test_utils.close_summary_writer(writer)
   xm.master_print(f'Min MSE: {min_mse:.2f} from Epoch {best_epoch}')
