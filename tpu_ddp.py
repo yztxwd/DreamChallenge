@@ -13,7 +13,9 @@ FLAGS = args_parse.parse_common_options(
     opts=[('--patience', {'type': int, 'default': 5}),
           ('--train_epochs', {'type': int, 'default': None}),
           ('--num_hybrid_conv', {'type': int, 'default': 1}),
-          ('--dropout', {'type': float, 'default': 0.5})])
+          ('--dropout', {'type': float, 'default': 0.5}),
+          ('--adamW', {'action': 'store_true'}),
+          ('--weight_decay', {'type': float, 'default': 1e-2})])
 
 import os
 import shutil
@@ -56,6 +58,7 @@ def _train_update(device, x, loss_item, tracker, writer):
       })
 
 def train_model(flags, **kwargs):
+  print(flags)
   torch.manual_seed(1)
 
   print(f"Device {xm.get_ordinal()} in world size of {xm.xrt_world_size()}")
@@ -78,7 +81,10 @@ def train_model(flags, **kwargs):
   device = xm.xla_device()
   model = model.to(device)
   #optimizer = optim.SGD(model.parameters(), lr=lr, momentum=flags.momentum)
-  optimizer = optim.Adam(model.parameters(), lr=lr)
+  if not flags.adamW:
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=flags.weight_decay)
+  else:
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=flags.weight_decay)
   loss_fn = nn.MSELoss()
 
   def train_loop_fn(epoch, loader):
@@ -134,7 +140,7 @@ def train_model(flags, **kwargs):
   # Early stopping
   mse, min_mse = 1e3, 1e3
   best_epoch = -1
-  patience = FLAGS.patience
+  patience = flags.patience
   trigger_times = 0
   for epoch in range(1, flags.num_epochs + 1):
     xm.master_print('Epoch {} train begin {}'.format(epoch, test_utils.now()))
@@ -170,6 +176,7 @@ def train_model(flags, **kwargs):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
           }, os.path.join(flags.logdir, f"checkpoint-best.ckpt"))
+    xm.master_print(f"Trigger time # is {trigger_times}, current epoch {epoch}")
 
   test_utils.close_summary_writer(writer)
   xm.master_print(f'Min MSE: {min_mse:.2f} from Epoch {best_epoch}')
