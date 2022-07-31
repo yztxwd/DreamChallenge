@@ -12,10 +12,10 @@ FLAGS = args_parse.parse_common_options(
     num_cores=1,
     num_epochs=100,
     num_workers=32,
-    opts=[('--num_hybrid_conv', {'type': int, 'nargs': '+', 'default': [1]}),
-          ('--dropout', {'type': float, 'nargs': '+', 'default': [0.5]}),
-          ('--names', {'type': str, 'nargs': '+'}),
-          ('--ckpts', {'type': str, 'nargs': '+'})])
+    opts=[('--num_hybrid_conv', {'type': int, 'default': 1}),
+          ('--dropout', {'type': float, 'default': 0.5}),
+          ('--name', {'type': str}),
+          ('--ckpt', {'type': str})])
 
 import os
 import sys
@@ -30,38 +30,37 @@ from tqdm import tqdm
 from dataloader import DreamChallengeDataModule 
 
 def main(index, flags):
-    device = xm.xla_device()
-    ordinal = xm.get_ordinal()
-    ckpt = flags.ckpts[ordinal]
-    name = flags.names[ordinal]
-    dropout = flags.dropout[ordinal]
-    num_hybrid_conv =flags.num_hybrid_conv[ordinal]
-    print(f"ckpt {ckpt} on device xla:{ordinal}")
     # load the checkpoint
-    print(f"Load model parameters from {ckpt}...")
-    checkpoint = torch.load(ckpt)
-    print(f"Dropout is {dropout}, num hybrid is {num_hybrid_conv}")
-    print(f"Best model loaded from epoch {checkpoint['epoch']}")
-    model = lightning_dreamchallenge.ConvolutionalModelHybrid(dropout=dropout, num_hybrid_conv=num_hybrid_conv)
-    model = model.to(device)
+    print(f"Load model parameters from {flags.ckpt}...")
+    checkpoint = torch.load(flags.ckpt)
+    model = lightning_dreamchallenge.ConvolutionalModelHybrid(dropout=flags.dropout, num_hybrid_conv=flags.num_hybrid_conv)
     model.load_state_dict(checkpoint['model_state_dict'])
 
     # load dataset
     datamodule = DreamChallengeDataModule(data_dir=flags.datadir, batch_size=flags.batch_size, num_workers=1)
     datamodule.setup()
+    print("setup!")
+
+    device = xm.xla_device()
+    model = model.to(device)
 
     def pred_loop_fn(loader):
       model.eval()
       pbar = tqdm(enumerate(loader))
       preds = []
+      targets = []
       for step, (data, target) in pbar:
         data = torch.squeeze(data, 0)
+        target = torch.squeeze(target, 0)
         pred = model(data)
         preds.append(pred)
+        targets.append(target)
       preds = torch.vstack(preds)
+      targets = torch.vstack(targets)
 
       # save the prediction
-      np.savetxt(os.path.join(os.path.dirname(ckpt), name + "model_preds.txt"), preds.detach().cpu().numpy(), fmt="%.6f")
+      np.savetxt(os.path.join(os.path.dirname(flags.ckpt), flags.name + "model_preds.txt"), preds.detach().cpu().numpy(), fmt="%.6f")
+      np.savetxt(os.path.join(os.path.dirname(flags.ckpt), flags.name + "model_targets.txt"), targets.detach().cpu().numpy(), fmt="%.6f")
     
       return preds
 
@@ -71,5 +70,4 @@ def main(index, flags):
     pred_loop_fn(pred_device_loader)
 
 if __name__ == "__main__":
-    print(f"Spawn {len(FLAGS.ckpts)} cores ...")
-    xmp.spawn(main, args=(FLAGS,), nprocs=len(FLAGS.ckpts))
+    xmp.spawn(main, args=(FLAGS,), nprocs=FLAGS.num_cores)

@@ -82,8 +82,10 @@ def train_model(flags, **kwargs):
   model = model.to(device)
   #optimizer = optim.SGD(model.parameters(), lr=lr, momentum=flags.momentum)
   if not flags.adamW:
+    print("Optimizer used: Adam")
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=flags.weight_decay)
   else:
+    print("Optimizer used: AdamW")
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=flags.weight_decay)
   loss_fn = nn.MSELoss()
 
@@ -165,7 +167,7 @@ def train_model(flags, **kwargs):
             print('Early stopping!\nStart to test process.')
             break
     else:
-        trigger_times = 0
+        #trigger_times = 0
 
         min_mse = mse
         best_epoch = epoch
